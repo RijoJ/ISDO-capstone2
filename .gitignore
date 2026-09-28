@@ -2,6 +2,7 @@
 @"
 .env
 labenv/
+chroma_db/
 __pycache__/
 *.pyc
 logs/
