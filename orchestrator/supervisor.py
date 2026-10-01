@@ -51,6 +51,7 @@ class TicketState(TypedDict, total=False):
     category: str
     priority: str
     sla_due: str
+    request_type: str  # added in Lab C7: 'Access Grant' etc., needed by the access-grant HITL trigger
     triage_category: str
     triage_priority: str
     triage_assignment_group: str
@@ -62,6 +63,7 @@ class TicketState(TypedDict, total=False):
     sla_breach_risk: str
     escalation_required: bool
     hitl_required: bool
+    hitl_reason: str  # added in Lab C7: which trigger fired, shown in the approval prompt
     hitl_approved: bool
     user_message: str
     final_status: str
@@ -225,13 +227,16 @@ def resolution_node(state: TicketState) -> TicketState:
             "auto_resolve": auto_resolve, "confidence": confidence, "audit_log": audit_log}
 
 # ══════════════════════════════════════════════════════
-# NODE 3 - SLA (checks the deadline, sets hitl_required for P1 CRITICAL/BREACHED)
+# NODE 3 - SLA (checks the deadline; sets hitl_required/hitl_reason for ANY of
+# three triggers added across Labs C5-C7: P1 CRITICAL/BREACHED, LOW KB
+# confidence, or an Access Grant request)
 # ══════════════════════════════════════════════════════
 
 def sla_node(state: TicketState) -> TicketState:
     print("\n> SLA AGENT - checking deadline")
 
     priority = state.get("triage_priority", state.get("priority", "P3"))
+    category = state.get("triage_category", state.get("category", ""))
     try:
         due_dt = datetime.strptime(state.get("sla_due", ""), "%Y-%m-%d %H:%M:%S")
         minutes_remaining = int((due_dt - SIMULATED_NOW).total_seconds() / 60)
@@ -249,17 +254,41 @@ def sla_node(state: TicketState) -> TicketState:
         risk = "ON_TRACK"
 
     escalation_required = risk in ("BREACHED", "CRITICAL") and priority in ("P1", "P2")
-    # Per spec: hitl_required is set specifically for P1 tickets that are CRITICAL or BREACHED.
-    hitl_required = priority == "P1" and risk in ("BREACHED", "CRITICAL")
+
+    # Lab C7: three independent HITL triggers. Checked in this priority order
+    # so that when more than one applies, the most safety-critical reason is
+    # the one shown to the approver (a P1 breach matters more than a low KB
+    # score, even if both happen to be true for the same ticket).
+    # Security-sensitive gate: trust the ticketing system's own category (what the
+    # requester/portal actually filed this as) over the model's reclassification --
+    # a ticket that mentions "VPN access" can get re-triaged as category=Network,
+    # which must never be able to silently bypass the access-grant approval gate.
+    is_access_grant = (state.get("category") == "Access" or category == "Access") \
+        and state.get("request_type") == "Access Grant"
+    is_low_confidence = state.get("confidence") == "LOW"
+    is_p1_critical = priority == "P1" and risk in ("BREACHED", "CRITICAL")
+
+    if is_p1_critical:
+        hitl_required, hitl_reason = True, f"P1 SLA {risk} -- requires senior approval before escalation"
+    elif is_access_grant:
+        hitl_required, hitl_reason = True, "ACCESS GRANT -- contractor/new-hire access request requires security approval"
+    elif is_low_confidence:
+        hitl_required, hitl_reason = True, "LOW KB confidence -- Resolution Agent could not find a clear fix"
+    else:
+        hitl_required, hitl_reason = False, ""
 
     audit_log = state.get("audit_log", [])
     audit_log.append(log("SLAAgent", "get_sla_status", f"Risk: {risk}  Minutes remaining: {minutes_remaining}"))
+    if hitl_required:
+        audit_log.append(log("SLAAgent", "hitl_trigger", hitl_reason))
 
     print(f"  SLA Risk: {risk}  |  Minutes remaining: {minutes_remaining}")
     print(f"  Escalation required: {escalation_required}  |  HITL required: {hitl_required}")
+    if hitl_required:
+        print(f"  HITL reason: {hitl_reason}")
 
     return {**state, "sla_breach_risk": risk, "escalation_required": escalation_required,
-            "hitl_required": hitl_required, "audit_log": audit_log}
+            "hitl_required": hitl_required, "hitl_reason": hitl_reason, "audit_log": audit_log}
 
 # ══════════════════════════════════════════════════════
 # NODE 4 - HITL GATE (asks a human for approval via input())
@@ -269,7 +298,7 @@ def hitl_node(state: TicketState) -> TicketState:
     print("\n> HITL GATE - human approval required")
     print(f"  {'!!! ' * 8}")
     print(f"  Ticket:  {state['ticket_number']}  |  Priority: {state.get('triage_priority')}")
-    print(f"  Reason:  SLA {state.get('sla_breach_risk')} -- escalation pending")
+    print(f"  Reason:  {state.get('hitl_reason') or 'escalation pending'}")
     print(f"  {'!!! ' * 8}")
 
     try:
@@ -294,8 +323,15 @@ def communication_node(state: TicketState) -> TicketState:
 
     if state.get("hitl_required"):
         if state.get("hitl_approved"):
-            msg = (f"Dear User,\n\nYour ticket {state['ticket_number']} has been escalated to our senior support "
-                   f"team and is being worked on as a priority. We will update you shortly.\n\nIT Support Team")
+            if (state.get("hitl_reason") or "").startswith("ACCESS GRANT"):
+                # Doc's C7 sample output uses access-grant-specific wording rather than
+                # the generic escalation message; this is additive, the other branches
+                # below are unchanged from C6.
+                msg = (f"Dear Requester,\n\nYour access grant request {state['ticket_number']} has been approved "
+                       f"by security and will be provisioned shortly.\n\nIT Support Team")
+            else:
+                msg = (f"Dear User,\n\nYour ticket {state['ticket_number']} has been escalated to our senior support "
+                       f"team and is being worked on as a priority. We will update you shortly.\n\nIT Support Team")
             final_status = "ESCALATED"
         else:
             msg = (f"Dear User,\n\nYour ticket {state['ticket_number']} requires additional review before we can "
@@ -360,6 +396,13 @@ if __name__ == "__main__":
         {"ticket_number": "INC0001002", "short_description": "ERP system down - SAP login failing",
          "description": "Multiple Finance users cannot login to SAP. Error DBCON_FAIL.",
          "category": "Application", "priority": "P1", "sla_due": "2024-01-15 11:00:00", "audit_log": []},
+        # Lab C7 Step 4: Access Grant request. HITL fires here from category + request_type
+        # alone, independent of SLA risk -- note request_type is an addition beyond the doc's
+        # literal test-ticket fields (see chat reply) because the access-grant HITL rule needs it.
+        {"ticket_number": "REQ-1002", "short_description": "VPN access for new contractor",
+         "description": "Contractor needs VPN access. Email: contractor@client.com",
+         "category": "Access", "request_type": "Access Grant", "priority": "P2",
+         "sla_due": "2024-01-15 15:00:00", "audit_log": []},
     ]
 
     all_results = []
@@ -367,7 +410,8 @@ if __name__ == "__main__":
         print(f"\n{'=' * 55}\nPROCESSING TICKET: {ticket['ticket_number']}\n{'=' * 55}")
         result = GRAPH.invoke(ticket)
         all_results.append(result)
-        print(f"\nFINAL STATUS: {result.get('final_status')}")
+        print(f"\nFINAL STATUS: {result.get('final_status')}"
+              + (f"  (HITL: {result.get('hitl_reason')})" if result.get("hitl_required") else ""))
 
     print(f"\n{'=' * 55}\nAUDIT LOG\n{'=' * 55}")
     for result in all_results:
