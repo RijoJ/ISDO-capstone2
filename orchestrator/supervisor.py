@@ -12,6 +12,7 @@ import os
 import re
 import sys
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Literal, TypedDict
 
@@ -25,6 +26,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")  # keep output printable on Windows
 
 load_dotenv()
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))  # so `guardrails` resolves regardless of the caller's cwd
+from guardrails.pii_redactor import AuditLogger, redact, restore  # noqa: E402
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 if not API_KEY:
@@ -41,9 +46,7 @@ AUTO_RESOLVE_PRIORITIES = {"P2", "P3", "P4"}
 A2A_BASE_URL = os.environ.get("A2A_KNOWLEDGE_SPECIALIST_URL", "http://localhost:8001")
 A2A_TIMEOUT_SECONDS = 15
 
-ROOT = Path(__file__).resolve().parent.parent
 KB_DIR = ROOT / "data" / "kb"
-
 client = anthropic.Anthropic(api_key=API_KEY)
 _temperature_supported = True
 
@@ -73,13 +76,28 @@ class TicketState(TypedDict, total=False):
     user_message: str
     final_status: str
     audit_log: list
+    pii_mapping: dict             # added in Lab C9: redaction map from triage_node, consumed by restore() in communication_node
+    short_description_clean: str  # added in Lab C9: PII-masked version actually sent to Claude
+    description_clean: str        # added in Lab C9: PII-masked version actually sent to Claude
 
-# -- AUDIT LOG ------------------------------------------------------------
+# -- AUDIT LOG (Lab C9: now backed by guardrails.pii_redactor.AuditLogger) ----
+#
+# Each node receives a shared AuditLogger instance (bound in via functools.partial
+# when the graph is built -- see build_graph()) rather than a bare module-level
+# logger, so a caller running multiple tickets/graphs can keep separate audit
+# trails if they want to. AuditLogger.log() does two things on every call: it
+# appends to its own internal, cross-ticket self.entries list AND writes the
+# entry to its JSONL file immediately. We also keep appending the same entry to
+# TicketState['audit_log'] as before, so each ticket's own state still carries
+# its complete, self-contained trail (useful if a ticket's state gets persisted
+# or inspected on its own, without needing the shared logger instance).
 
-def log(agent, action, detail):
-    entry = {"timestamp": datetime.now().isoformat(), "agent": agent, "action": action, "detail": detail}
-    print(f"  [AUDIT] {agent}: {action} -- {detail}")
-    return entry
+def _log(audit_logger, state, agent, action, rationale, tool="", approval_status="N/A"):
+    # AuditLogger.log() already prints its own "[AUDIT] agent | action | ticket | status"
+    # line and appends to its internal cross-ticket entries list and JSONL file, so we
+    # don't print again here -- just return the entry for TicketState['audit_log'].
+    return audit_logger.log(agent=agent, action=action, ticket_number=state.get("ticket_number", ""),
+                            tool=tool, rationale=rationale, approval_status=approval_status)
 
 
 def call_model(**kwargs):
@@ -151,16 +169,39 @@ KB = build_kb()
 # NODE 1 - TRIAGE (calls Claude to classify the ticket as JSON)
 # ══════════════════════════════════════════════════════
 
-def triage_node(state: TicketState) -> TicketState:
+def triage_node(state: TicketState, audit_logger: AuditLogger) -> TicketState:
     print(f"\n> TRIAGE AGENT - {state['ticket_number']}")
 
-    prompt = (f"Classify this IT ticket:\n\nSummary: {state['short_description']}\nDetails: {state['description']}\n\n"
+    # Lab C9: redact PII before anything leaves the process for Claude. Both
+    # fields are redacted together (joined by a separator that redact() will
+    # never touch) so NAME_1/EMAIL_1/etc. numbering is consistent across the
+    # two fields instead of each restarting its own counter -- which would
+    # otherwise make the mapping ambiguous (two different [NAME_1] tokens).
+    _SEP = "\n|||ISDO-PII-SPLIT|||\n"
+    combined_clean, pii_mapping = redact(f"{state['short_description']}{_SEP}{state['description']}")
+    short_description_clean, description_clean = combined_clean.split(_SEP, 1)
+
+    audit_log = state.get("audit_log", [])
+    if pii_mapping:
+        audit_log.append(_log(audit_logger, state, "TriageAgent", "redact_pii",
+                              f"{len(pii_mapping)} PII item(s) masked before sending to Claude: "
+                              f"{list(pii_mapping.keys())}", tool="pii_redactor.redact"))
+        print(f"  PII masked before Claude call: {list(pii_mapping.keys())}")
+
+    prompt = (f"Classify this IT ticket:\n\nSummary: {short_description_clean}\nDetails: {description_clean}\n\n"
               "Return JSON with: category, priority, assignment_group, pii_detected, reasoning. "
               "Category must be exactly ONE of: Network, Application, Hardware, Access, Email, Server, Software. "
               "Priority: P1=critical/many users, P2=significant, P3=single user, P4=request. "
+              "Keep reasoning to one short clause, under 15 words. "
               "Only return the JSON object, no other text.")
 
-    response = call_model(model=MODEL, max_tokens=400, messages=[{"role": "user", "content": prompt}])
+    # max_tokens=600, not 400: at 400, a model that writes a longer "reasoning"
+    # sentence can get cut off before the closing brace, producing invalid JSON
+    # that both json.loads() and the regex fallback below correctly reject --
+    # which then silently falls through to the CSV-value fallback on every
+    # single ticket. Tightening the reasoning instruction above also helps,
+    # but the token headroom is the actual fix.
+    response = call_model(model=MODEL, max_tokens=600, messages=[{"role": "user", "content": prompt}])
     text = extract_text(response)
 
     try:
@@ -175,27 +216,41 @@ def triage_node(state: TicketState) -> TicketState:
             result = {"category": state.get("category", "Unknown"), "priority": state.get("priority", "P3"),
                       "assignment_group": "Service-Desk", "pii_detected": False}
 
-    audit_log = state.get("audit_log", [])
-    audit_log.append(log("TriageAgent", "classify_ticket", f"{result.get('category')}/{result.get('priority')}"))
+    audit_log.append(_log(audit_logger, state, "TriageAgent", "classify_ticket",
+                          f"{result.get('category')}/{result.get('priority')}", tool="classify_ticket"))
 
     print(f"  Category: {result.get('category')}  Priority: {result.get('priority')}")
-    print(f"  Assign To: {result.get('assignment_group')}  PII: {result.get('pii_detected')}")
+    # Not result.get('pii_detected') alone -- that's just this call's raw flag, which the
+    # CSV-fallback path always hardcodes to False. The actual stored field (below) is
+    # ORed with whether redact() found anything, so the print should match that, not
+    # silently show False for a ticket we know has masked PII (like REQ-1002 above).
+    pii_final = bool(result.get("pii_detected", False)) or bool(pii_mapping)
+    print(f"  Assign To: {result.get('assignment_group')}  PII: {pii_final}")
 
     return {**state,
             "triage_category": result.get("category", state.get("category", "")),
             "triage_priority": result.get("priority", state.get("priority", "P3")),
             "triage_assignment_group": result.get("assignment_group", "Service-Desk"),
-            "pii_detected": bool(result.get("pii_detected", False)),
+            "pii_detected": bool(result.get("pii_detected", False)) or bool(pii_mapping),
+            "pii_mapping": pii_mapping,
+            "short_description_clean": short_description_clean,
+            "description_clean": description_clean,
             "audit_log": audit_log}
 
 # ══════════════════════════════════════════════════════
 # NODE 2 - RESOLUTION (queries ChromaDB, drafts a resolution)
 # ══════════════════════════════════════════════════════
 
-def resolution_node(state: TicketState) -> TicketState:
+def resolution_node(state: TicketState, audit_logger: AuditLogger) -> TicketState:
     print("\n> RESOLUTION AGENT - searching KB")
+    # Lab C9: use the PII-masked version triage_node already produced, not the raw
+    # field -- this prompt and the A2A call below both leave the process (local
+    # model call + external Knowledge Specialist), so both need the same masking
+    # the triage prompt gets. Falls back to raw text only if resolution_node is
+    # ever invoked standalone without triage_node having run first.
+    query_text = state.get("short_description_clean", state["short_description"])
 
-    results = KB.query(query_texts=[state["short_description"]], n_results=min(10, KB.count()))
+    results = KB.query(query_texts=[query_text], n_results=min(10, KB.count()))
     best_per_file = {}
     for meta, distance in zip(results["metadatas"][0], results["distances"][0]):
         fname = meta["filename"]
@@ -215,8 +270,12 @@ def resolution_node(state: TicketState) -> TicketState:
 
     if article_content:
         prompt = (f"Based on this KB article, draft a resolution for the user.\n\nKB Article ({article_name}):\n"
-                  f"{article_content}\n\nTicket: {state['short_description']}\nWrite 3-4 numbered steps. Plain English.")
-        response = call_model(model=MODEL, max_tokens=400, messages=[{"role": "user", "content": prompt}])
+                  f"{article_content}\n\nTicket: {query_text}\nWrite 3-4 numbered steps. Plain English.")
+        # max_tokens=700, not 400 -- at 400 a full KB article plus a 3-4 step
+        # write-up can get cut off mid-sentence (seen in testing: a real run
+        # truncated step 3 mid-word), which then goes straight to the user as
+        # an incomplete, unprofessional resolution message.
+        response = call_model(model=MODEL, max_tokens=700, messages=[{"role": "user", "content": prompt}])
         resolution = extract_text(response)
     else:
         resolution = "No matching KB article was found. This ticket needs manual investigation by L2."
@@ -235,7 +294,7 @@ def resolution_node(state: TicketState) -> TicketState:
         try:
             post_resp = requests.post(
                 f"{A2A_BASE_URL}/tasks",
-                json={"query": state["short_description"], "ticket_number": state["ticket_number"],
+                json={"query": query_text, "ticket_number": state["ticket_number"],
                       "context": f"category={state.get('triage_category', state.get('category', ''))}, "
                                  f"priority={priority}"},
                 timeout=A2A_TIMEOUT_SECONDS,
@@ -256,19 +315,22 @@ def resolution_node(state: TicketState) -> TicketState:
             auto_resolve = confidence == "HIGH" and priority in AUTO_RESOLVE_PRIORITIES
 
             print(f"  A2A RESULT: Best Match: {article_name}  |  Confidence: {confidence} ({score:.0%})")
-            audit_log.append(log("ResolutionAgent", "a2a_knowledge_specialist",
-                                 f"A2A returned {confidence} ({score:.0%}), article: {article_name}"))
+            audit_log.append(_log(audit_logger, state, "ResolutionAgent", "a2a_knowledge_specialist",
+                                  f"A2A returned {confidence} ({score:.0%}), article: {article_name}",
+                                  tool="a2a:knowledge_specialist"))
 
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             # Knowledge Specialist isn't running / didn't respond in time -- this is
             # expected and handled, not a crash: keep the local LOW result and move on.
             print(f"  (A2A Knowledge Specialist unreachable: {type(e).__name__} -- "
                   f"keeping local LOW confidence, HITL will review this ticket)")
-            audit_log.append(log("ResolutionAgent", "a2a_knowledge_specialist",
-                                 f"A2A call failed ({type(e).__name__}) -- kept local LOW confidence"))
+            audit_log.append(_log(audit_logger, state, "ResolutionAgent", "a2a_knowledge_specialist",
+                                  f"A2A call failed ({type(e).__name__}) -- kept local LOW confidence",
+                                  tool="a2a:knowledge_specialist", approval_status="FAILED"))
 
-    audit_log.append(log("ResolutionAgent", "search_kb",
-                         f"Article: {article_name}  Confidence: {confidence} ({score:.0%})  AutoResolve: {auto_resolve}"))
+    audit_log.append(_log(audit_logger, state, "ResolutionAgent", "search_kb",
+                          f"Article: {article_name}  Confidence: {confidence} ({score:.0%})  AutoResolve: {auto_resolve}",
+                          tool="search_kb"))
 
     print(f"  KB Article: {article_name}")
     print(f"  Confidence: {confidence} ({score:.0%})  |  Auto-resolve: {auto_resolve}")
@@ -282,7 +344,7 @@ def resolution_node(state: TicketState) -> TicketState:
 # confidence, or an Access Grant request)
 # ══════════════════════════════════════════════════════
 
-def sla_node(state: TicketState) -> TicketState:
+def sla_node(state: TicketState, audit_logger: AuditLogger) -> TicketState:
     print("\n> SLA AGENT - checking deadline")
 
     priority = state.get("triage_priority", state.get("priority", "P3"))
@@ -328,9 +390,11 @@ def sla_node(state: TicketState) -> TicketState:
         hitl_required, hitl_reason = False, ""
 
     audit_log = state.get("audit_log", [])
-    audit_log.append(log("SLAAgent", "get_sla_status", f"Risk: {risk}  Minutes remaining: {minutes_remaining}"))
+    audit_log.append(_log(audit_logger, state, "SLAAgent", "get_sla_status",
+                          f"Risk: {risk}  Minutes remaining: {minutes_remaining}", tool="get_sla_status"))
     if hitl_required:
-        audit_log.append(log("SLAAgent", "hitl_trigger", hitl_reason))
+        audit_log.append(_log(audit_logger, state, "SLAAgent", "hitl_trigger", hitl_reason,
+                              approval_status="PENDING"))
 
     print(f"  SLA Risk: {risk}  |  Minutes remaining: {minutes_remaining}")
     print(f"  Escalation required: {escalation_required}  |  HITL required: {hitl_required}")
@@ -344,7 +408,7 @@ def sla_node(state: TicketState) -> TicketState:
 # NODE 4 - HITL GATE (asks a human for approval via input())
 # ══════════════════════════════════════════════════════
 
-def hitl_node(state: TicketState) -> TicketState:
+def hitl_node(state: TicketState, audit_logger: AuditLogger) -> TicketState:
     print("\n> HITL GATE - human approval required")
     print(f"  {'!!! ' * 8}")
     print(f"  Ticket:  {state['ticket_number']}  |  Priority: {state.get('triage_priority')}")
@@ -359,7 +423,9 @@ def hitl_node(state: TicketState) -> TicketState:
     approved = decision == "y"
 
     audit_log = state.get("audit_log", [])
-    audit_log.append(log("HITLGate", "approval_decision", "APPROVED" if approved else "REJECTED"))
+    audit_log.append(_log(audit_logger, state, "HITLGate", "approval_decision",
+                          f"Human operator {'approved' if approved else 'rejected'}: {state.get('hitl_reason')}",
+                          approval_status="APPROVED" if approved else "REJECTED"))
 
     print(f"  Decision: {'APPROVED' if approved else 'REJECTED'}")
     return {**state, "hitl_approved": approved, "audit_log": audit_log}
@@ -368,7 +434,14 @@ def hitl_node(state: TicketState) -> TicketState:
 # NODE 5 - COMMUNICATION (drafts the user message)
 # ══════════════════════════════════════════════════════
 
-def communication_node(state: TicketState) -> TicketState:
+def post_comment_to_servicenow(ticket_number, message):
+    """Simulated ServiceNow comment post -- same mock style as sla_node's update_ticket().
+    The message passed in here must already have PII restored: ServiceNow is the
+    system of record and should see real names/emails, not [NAME_1]-style tokens."""
+    print(f"  [ServiceNow Mock] Posted comment to {ticket_number}: {message[:60].strip()}...")
+
+
+def communication_node(state: TicketState, audit_logger: AuditLogger) -> TicketState:
     print("\n> COMMUNICATION AGENT - drafting user message")
 
     if state.get("hitl_required"):
@@ -398,11 +471,28 @@ def communication_node(state: TicketState) -> TicketState:
         final_status = "ESCALATED" if state.get("escalation_required") else "IN_PROGRESS"
 
     audit_log = state.get("audit_log", [])
-    audit_log.append(log("CommunicationAgent", "post_comment", f"final_status={final_status}"))
+    audit_log.append(_log(audit_logger, state, "CommunicationAgent", "post_comment",
+                          f"final_status={final_status}", tool="post_comment"))
 
-    print(f"\n  USER MESSAGE:\n  {'-' * 40}\n  {msg}\n  {'-' * 40}")
+    print(f"\n  USER MESSAGE (as drafted, may still contain PII tokens):\n  {'-' * 40}\n  {msg}\n  {'-' * 40}")
 
-    return {**state, "user_message": msg, "final_status": final_status, "audit_log": audit_log}
+    # Lab C9: restore PII tokens back to real values before this goes to the
+    # system of record. The draft above was built from resolution_text, which
+    # the model generated from redacted input -- if the model happened to
+    # echo a token like [NAME_1] or [EMAIL_1] back verbatim, restore() swaps
+    # it for the real value here so ServiceNow (which should hold the real
+    # record) doesn't end up with a token in it.
+    pii_mapping = state.get("pii_mapping", {})
+    final_msg = restore(msg, pii_mapping) if pii_mapping else msg
+    if pii_mapping and final_msg != msg:
+        audit_log.append(_log(audit_logger, state, "CommunicationAgent", "restore_pii",
+                              f"{len(pii_mapping)} PII token(s) restored before posting to ServiceNow",
+                              tool="pii_redactor.restore"))
+        print(f"\n  USER MESSAGE (after restore, as sent to ServiceNow):\n  {'-' * 40}\n  {final_msg}\n  {'-' * 40}")
+
+    post_comment_to_servicenow(state["ticket_number"], final_msg)
+
+    return {**state, "user_message": final_msg, "final_status": final_status, "audit_log": audit_log}
 
 # ══════════════════════════════════════════════════════
 # ROUTING
@@ -415,13 +505,13 @@ def route_after_sla(state: TicketState) -> Literal["hitl", "communication"]:
 # BUILD GRAPH
 # ══════════════════════════════════════════════════════
 
-def build_graph():
+def build_graph(audit_logger: AuditLogger):
     g = StateGraph(TicketState)
-    g.add_node("triage", triage_node)
-    g.add_node("resolution", resolution_node)
-    g.add_node("sla", sla_node)
-    g.add_node("hitl", hitl_node)
-    g.add_node("communication", communication_node)
+    g.add_node("triage", partial(triage_node, audit_logger=audit_logger))
+    g.add_node("resolution", partial(resolution_node, audit_logger=audit_logger))
+    g.add_node("sla", partial(sla_node, audit_logger=audit_logger))
+    g.add_node("hitl", partial(hitl_node, audit_logger=audit_logger))
+    g.add_node("communication", partial(communication_node, audit_logger=audit_logger))
 
     g.set_entry_point("triage")
     g.add_edge("triage", "resolution")
@@ -432,7 +522,16 @@ def build_graph():
     return g.compile()
 
 
-GRAPH = build_graph()
+# A single shared AuditLogger instance, created once and bound into every node
+# via build_graph() above -- this is what "pass audit_logger to each node" means
+# here, since LangGraph calls a node as fn(state), so the logger has to be
+# closed over (via functools.partial) rather than passed as a second argument
+# at call time. Each node ALSO still appends its own entries to
+# TicketState['audit_log'] (unchanged from C6-C8), so every ticket's own state
+# carries its complete trail even if you only ever look at that one result;
+# AUDIT_LOGGER.entries additionally gives you the cross-ticket trail in one place.
+AUDIT_LOGGER = AuditLogger(log_file=str(ROOT / "logs" / "audit_trail.jsonl"))
+GRAPH = build_graph(AUDIT_LOGGER)
 
 # ══════════════════════════════════════════════════════
 # RUN
@@ -450,7 +549,7 @@ if __name__ == "__main__":
         # alone, independent of SLA risk -- note request_type is an addition beyond the doc's
         # literal test-ticket fields (see chat reply) because the access-grant HITL rule needs it.
         {"ticket_number": "REQ-1002", "short_description": "VPN access for new contractor",
-         "description": "Contractor needs VPN access. Email: contractor@client.com",
+         "description": "Contractor Priya Nair needs VPN access. Email: contractor@client.com",
          "category": "Access", "request_type": "Access Grant", "priority": "P2",
          "sla_due": "2024-01-15 15:00:00", "audit_log": []},
     ]
@@ -463,8 +562,24 @@ if __name__ == "__main__":
         print(f"\nFINAL STATUS: {result.get('final_status')}"
               + (f"  (HITL: {result.get('hitl_reason')})" if result.get("hitl_required") else ""))
 
-    print(f"\n{'=' * 55}\nAUDIT LOG\n{'=' * 55}")
+    # Lab C9 Step 4: prove PII never reached Claude -- show the raw description
+    # the ticket came in with side by side with the redacted version that was
+    # actually put in the triage prompt.
+    print(f"\n{'=' * 55}\nPII MASKING CHECK (raw ticket vs. what Claude actually saw)\n{'=' * 55}")
+    for result in all_results:
+        mapping = result.get("pii_mapping") or {}
+        print(f"\n{result['ticket_number']}:")
+        print(f"  RAW description:   {result.get('description')}")
+        print(f"  SENT to Claude:    {result.get('description_clean')}")
+        print(f"  PII items masked:  {len(mapping)}  {list(mapping.keys()) if mapping else '(none found)'}")
+
+    print(f"\n{'=' * 55}\nPER-TICKET AUDIT LOG (TicketState['audit_log'])\n{'=' * 55}")
     for result in all_results:
         print(f"\n{result['ticket_number']}:")
         for entry in result.get("audit_log", []):
-            print(f"  {entry['timestamp']}  {entry['agent']:<20}{entry['action']:<20}{entry['detail']}")
+            print(f"  {entry['timestamp'][:19]}  {entry['agent']:<20}{entry['action']:<20}{entry['approval_status']}")
+
+    # The shared AuditLogger's own view: every entry from every ticket, in the
+    # order they actually happened, via its own print_trail() helper.
+    AUDIT_LOGGER.print_trail()
+    print(f"\nFull audit trail also written to: {AUDIT_LOGGER.log_file}")
