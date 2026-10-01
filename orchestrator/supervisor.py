@@ -17,6 +17,7 @@ from typing import Literal, TypedDict
 
 import anthropic
 import chromadb
+import requests
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
 
@@ -35,6 +36,10 @@ SLA_MINUTES = {"P1": 60, "P2": 240, "P3": 480, "P4": 1440}
 SIMULATED_NOW = datetime(2024, 1, 15, 10, 30)
 # Priorities allowed to auto-resolve at HIGH confidence. P1 never auto-resolves.
 AUTO_RESOLVE_PRIORITIES = {"P2", "P3", "P4"}
+
+# Lab C8: A2A Knowledge Specialist, called from resolution_node when ChromaDB confidence is LOW.
+A2A_BASE_URL = os.environ.get("A2A_KNOWLEDGE_SPECIALIST_URL", "http://localhost:8001")
+A2A_TIMEOUT_SECONDS = 15
 
 ROOT = Path(__file__).resolve().parent.parent
 KB_DIR = ROOT / "data" / "kb"
@@ -217,6 +222,51 @@ def resolution_node(state: TicketState) -> TicketState:
         resolution = "No matching KB article was found. This ticket needs manual investigation by L2."
 
     audit_log = state.get("audit_log", [])
+
+    # Lab C8: local ChromaDB confidence is LOW -> ask the A2A Knowledge Specialist
+    # for a deeper look before giving up and routing straight to a human. If the
+    # specialist is unreachable, we deliberately do NOT raise -- we keep the local
+    # LOW-confidence result exactly as it was, which (via sla_node's confidence=="LOW"
+    # check) is itself what sends this ticket to the HITL gate. So "fall back to
+    # HITL" here means: on any A2A failure, just proceed with what ChromaDB already
+    # gave us and let the existing LOW-confidence HITL trigger do its job.
+    if confidence == "LOW":
+        print("  -> Confidence LOW -- calling A2A Knowledge Specialist")
+        try:
+            post_resp = requests.post(
+                f"{A2A_BASE_URL}/tasks",
+                json={"query": state["short_description"], "ticket_number": state["ticket_number"],
+                      "context": f"category={state.get('triage_category', state.get('category', ''))}, "
+                                 f"priority={priority}"},
+                timeout=A2A_TIMEOUT_SECONDS,
+            )
+            post_resp.raise_for_status()
+            task_id = post_resp.json()["task_id"]
+            print(f"  -> POST {A2A_BASE_URL}/tasks  task_id: {task_id}")
+
+            get_resp = requests.get(f"{A2A_BASE_URL}/tasks/{task_id}", timeout=A2A_TIMEOUT_SECONDS)
+            get_resp.raise_for_status()
+            a2a_result = get_resp.json()["result"]
+            print(f"  -> GET  {A2A_BASE_URL}/tasks/{task_id}")
+
+            confidence = a2a_result.get("confidence", confidence)
+            score = a2a_result.get("confidence_score", score)
+            resolution = a2a_result.get("resolution", resolution)
+            article_name = a2a_result.get("best_match", article_name)
+            auto_resolve = confidence == "HIGH" and priority in AUTO_RESOLVE_PRIORITIES
+
+            print(f"  A2A RESULT: Best Match: {article_name}  |  Confidence: {confidence} ({score:.0%})")
+            audit_log.append(log("ResolutionAgent", "a2a_knowledge_specialist",
+                                 f"A2A returned {confidence} ({score:.0%}), article: {article_name}"))
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Knowledge Specialist isn't running / didn't respond in time -- this is
+            # expected and handled, not a crash: keep the local LOW result and move on.
+            print(f"  (A2A Knowledge Specialist unreachable: {type(e).__name__} -- "
+                  f"keeping local LOW confidence, HITL will review this ticket)")
+            audit_log.append(log("ResolutionAgent", "a2a_knowledge_specialist",
+                                 f"A2A call failed ({type(e).__name__}) -- kept local LOW confidence"))
+
     audit_log.append(log("ResolutionAgent", "search_kb",
                          f"Article: {article_name}  Confidence: {confidence} ({score:.0%})  AutoResolve: {auto_resolve}"))
 
